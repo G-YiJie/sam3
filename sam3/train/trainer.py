@@ -303,6 +303,12 @@ class Trainer:
     def _setup_ddp_distributed_training(self, distributed_conf, accelerator):
         assert isinstance(self.model, torch.nn.Module)
 
+        # Skip DDP wrapping for single-GPU training to avoid gloo bfloat16 broadcast issues
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        if world_size == 1:
+            logging.info("Skipping DDP wrapping for single-GPU training")
+            return
+
         self.model = nn.parallel.DistributedDataParallel(
             self.model,
             device_ids=[self.local_rank] if accelerator == "cuda" else [],
@@ -862,6 +868,13 @@ class Trainer:
                 mem_meter.update(reset_peak_usage=True)
                 if data_iter % self.logging_conf.log_freq == 0:
                     progress.display(data_iter)
+                    self._log_training_progress(
+                        data_iter,
+                        iters_per_epoch,
+                        loss_mts,
+                        extra_loss_mts,
+                        phase,
+                    )
 
                 if data_iter % self.logging_conf.log_scalar_frequency == 0:
                     # Log progress meters.
@@ -901,6 +914,38 @@ class Trainer:
                     data_time,
                     step,
                 )
+
+    def _log_training_progress(
+        self,
+        data_iter: int,
+        iters_per_epoch: int,
+        loss_mts: Dict[str, AverageMeter],
+        extra_loss_mts: Dict[str, AverageMeter],
+        phase: str,
+    ) -> None:
+        if self.distributed_rank != 0:
+            return
+        loss_components = []
+        for name, meter in loss_mts.items():
+            if meter.count == 0:
+                continue
+            pretty_name = name.split("/")[-1]
+            loss_components.append(f"{pretty_name}={meter.val:.4f}")
+
+        extra_components = []
+        for name, meter in extra_loss_mts.items():
+            if meter.val is None:
+                continue
+            extra_components.append(f"{name.split('/')[-1]}={meter.val:.4f}")
+
+        if not loss_components and not extra_components:
+            return
+
+        components_str = ", ".join(loss_components + extra_components)
+        logging.info(
+            f"Train epoch {self.epoch} ({data_iter + 1}/{iters_per_epoch}) - "
+            f"{components_str}"
+        )
 
     def _run_step(
         self,

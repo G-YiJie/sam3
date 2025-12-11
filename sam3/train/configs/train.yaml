@@ -1,0 +1,245 @@
+# @package _global_
+
+scratch:
+  resolution: 1008 # SAM3 model expects 1008x1008 images
+  train_batch_size: 1
+  num_train_workers: 10
+  num_frames: 1
+  max_num_objects: 50 # Increased to handle images with many annotations
+  base_lr: 5.0e-6
+  vision_lr: 3.0e-06
+  phases_per_epoch: 1
+  num_epochs: 30
+
+dataset:
+  # PATHS to Dataset
+  img_folder: data/train # PATH to MOSE JPEGImages folder
+  gt_folder: data/train/_annotations.coco.json # PATH to COCO annotations file
+  #file_list_txt: training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
+  multiplier: 2
+
+# Video transforms
+vos:
+  train_transforms:
+    - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
+      transforms:
+        # Decode RLE masks to tensors first before any geometric transforms
+        - _target_: sam3.train.transforms.segmentation.DecodeRle
+        - _target_: sam3.train.transforms.basic_for_api.RandomHorizontalFlip
+          consistent_transform: True
+        - _target_: sam3.train.transforms.basic_for_api.RandomAffine
+          degrees: 25
+          shear: 20
+          image_interpolation: bilinear
+          consistent_transform: True
+        - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          square: true
+          consistent_transform: True
+        - _target_: sam3.train.transforms.basic_for_api.ColorJitter
+          consistent_transform: True
+          brightness: 0.1
+          contrast: 0.03
+          saturation: 0.03
+          hue: null
+        - _target_: sam3.train.transforms.basic_for_api.RandomGrayscale
+          p: 0.05
+          consistent_transform: True
+        - _target_: sam3.train.transforms.basic_for_api.ColorJitter
+          consistent_transform: False
+          brightness: 0.1
+          contrast: 0.05
+          saturation: 0.05
+          hue: null
+        - _target_: sam3.train.transforms.basic_for_api.ToTensorAPI
+        - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+trainer:
+  _target_: sam3.train.trainer.Trainer
+  mode: train_only
+  max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
+  accelerator: cuda
+  seed_value: 123
+
+  model:
+    _target_: sam3.model_builder.build_sam3_image_model
+    bpe_path: assets/bpe_simple_vocab_16e6.txt.gz
+    device: cuda
+    eval_mode: false
+    load_from_HF: false
+    enable_segmentation: true
+    enable_inst_interactivity: false
+
+  data:
+    train:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+        transforms: ${vos.train_transforms}
+        load_segmentation: true
+        max_ann_per_img: ${scratch.max_num_objects}
+        multiplier: ${dataset.multiplier}
+        training: true
+        use_caching: false
+        img_folder: ${dataset.img_folder}
+        ann_file: ${dataset.gt_folder}
+      shuffle: True
+      batch_size: ${scratch.train_batch_size}
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: True
+      drop_last: True
+      collate_fn:
+        _target_: sam3.train.data.collator.collate_fn_api
+        _partial_: true
+        repeats: 1
+        dict_key: all
+        with_seg_masks: true
+
+  optim:
+    amp:
+      enabled: True
+      amp_dtype: bfloat16
+
+    optimizer:
+      _target_: torch.optim.AdamW
+
+    gradient_clip:
+      _target_: sam3.train.optim.optimizer.GradientClipper
+      max_norm: 0.1
+      norm_type: 2
+
+    param_group_modifiers:
+      - _target_: sam3.train.optim.optimizer.layer_decay_param_modifier
+        _partial_: True
+        layer_decay_value: 0.9
+        apply_to: "backbone.vision_backbone.trunk"
+        overrides:
+          - pattern: "*pos_embed*"
+            value: 1.0
+
+    options:
+      lr:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: ${scratch.base_lr}
+            end_value: ${divide:${scratch.base_lr},10}
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: ${scratch.vision_lr}
+            end_value: ${divide:${scratch.vision_lr},10}
+          param_names:
+            - "backbone.vision_backbone.*"
+      weight_decay:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.1
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.0
+          param_names:
+            - "*bias*"
+          module_cls_names: ["torch.nn.LayerNorm"]
+
+  loss:
+    all:
+      _target_: sam3.train.loss.sam3_loss.Sam3LossWrapper
+      matcher:
+        _target_: sam3.train.matcher.BinaryHungarianMatcherV2
+        focal: true
+        cost_class: 2.0
+        cost_bbox: 5.0
+        cost_giou: 2.0
+        alpha: 0.25
+        gamma: 2
+        stable: false
+      o2m_weight: 2.0
+      o2m_matcher:
+        _target_: sam3.train.matcher.BinaryOneToManyMatcher
+        alpha: 0.3
+        threshold: 0.4
+        topk: 4
+      use_o2m_matcher_on_o2m_aux: false
+      loss_fns_find:
+        - _target_: sam3.train.loss.loss_fns.Boxes
+          weight_dict:
+            loss_bbox: 5.0
+            loss_giou: 2.0
+        - _target_: sam3.train.loss.loss_fns.IABCEMdetr
+          weak_loss: false
+          weight_dict:
+            loss_ce: 20.0
+            presence_loss: 20.0
+          pos_weight: 10.0
+          alpha: 0.25
+          gamma: 2
+          use_presence: true
+          pos_focal: false
+          pad_n_queries: 200
+          pad_scale_pos: 1.0
+        - _target_: sam3.train.loss.loss_fns.Masks
+          focal_alpha: 0.25
+          focal_gamma: 2.0
+          weight_dict:
+            loss_mask: 20.0
+            loss_dice: 1.0
+          compute_aux: false
+      loss_fn_semantic_seg: null
+      scale_by_find_batch_size: true
+
+  distributed:
+    backend: gloo
+    find_unused_parameters: true
+    gradient_as_bucket_view: true
+
+  logging:
+    tensorboard_writer:
+      _target_: sam3.train.utils.logger.make_tensorboard_logger
+      log_dir: ${launcher.experiment_log_dir}/tensorboard
+      flush_secs: 120
+      should_log: True
+    wandb_writer: null
+    log_dir: ${launcher.experiment_log_dir}/logs
+    log_freq: 200
+
+  # initialize from a SAM3 checkpoint
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 0 # 0 only last checkpoint is saved.
+    model_weight_initializer:
+      _partial_: True
+      _target_: sam3.train.utils.checkpoint_utils.load_state_dict_into_model
+      strict: false
+      # Leave empty to avoid assertion if no params match a pattern; unexpected keys are filtered by checkpoint_kernels
+      ignore_unexpected_keys: []
+      ignore_missing_keys: null
+
+      state_dict:
+        _target_: sam3.train.utils.checkpoint_utils.load_checkpoint_and_apply_kernels
+        checkpoint_path: sam3/train/configs/sam3.pt # PATH to SAM3 checkpoint
+        ckpt_state_dict_keys: [] # Empty list because keys are at root level, not nested under "model"
+        checkpoint_kernels:
+          - _target_: sam3.train.utils.checkpoint_utils.CkptRemovePrefixKernel
+            prefix: "detector."
+          - _target_: sam3.train.utils.checkpoint_utils.CkptExcludeKernel
+            key_pattern:
+              - "tracker.*"
+              - "backbone.vision_backbone.sam2_convs.*"
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 1
+  experiment_log_dir: sam3_logs/finetune_sam3 # Explicit log dir so checkpoints land in a predictable place
+  multiprocessing_context: forkserver
+
+# SLURM args if running on a cluster
+submitit:
+  partition: null
+  account: null
+  qos: null
+  cpus_per_task: 10
+  use_cluster: false
+  timeout_hour: 24
+  name: null
+  port_range: [10000, 65000]

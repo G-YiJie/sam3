@@ -183,6 +183,39 @@ class CkptExcludeKernel:
         return {k: v for k, v in state_dict.items() if k not in exclude_keys}
 
 
+class CkptRemovePrefixKernel:
+    """
+    Removes a specified prefix from all keys in the state_dict.
+
+    Args:
+        prefix: The prefix string to remove from all keys.
+    """
+
+    def __init__(self, prefix: str):
+        self.prefix = prefix
+
+    def __call__(self, state_dict: Dict):
+        """
+        Args:
+            state_dict: A dictionary representing the given checkpoint's state dict.
+        
+        Returns:
+            A new state_dict with the prefix removed from all keys.
+        """
+        if not self.prefix:
+            return state_dict
+        
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith(self.prefix):
+                new_key = key[len(self.prefix):]
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        
+        return new_state_dict
+
+
 def load_checkpoint(
     path_list: List[str],
     pick_recursive_keys: Optional[List[str]] = None,
@@ -231,7 +264,7 @@ def get_state_dict(checkpoint, ckpt_state_dict_keys):
             isinstance(pre_train_dict, Sequence) and key >= len(pre_train_dict)
         ):
             key_str = (
-                '["' + '"]["'.join(list(map(ckpt_state_dict_keys[:i], str))) + '"]'
+                '["' + '"]["'.join(list(map(str, ckpt_state_dict_keys[:i]))) + '"]'
             )
             raise KeyError(
                 f"'{key}' not found in checkpoint{key_str} "
